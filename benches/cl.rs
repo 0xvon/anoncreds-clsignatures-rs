@@ -1,13 +1,13 @@
 use std::time::{Duration, Instant};
 
 use anoncreds_clsignatures::*;
+use rand::Rng;
 
-pub fn get_credential_schema() -> CredentialSchema {
+pub fn get_credential_schema(attr_size: usize) -> CredentialSchema {
     let mut credential_schema_builder = Issuer::new_credential_schema_builder().unwrap();
-    credential_schema_builder.add_attr("name").unwrap();
-    credential_schema_builder.add_attr("sex").unwrap();
-    credential_schema_builder.add_attr("age").unwrap();
-    credential_schema_builder.add_attr("height").unwrap();
+    for i in 1..attr_size {
+        credential_schema_builder.add_attr(&i.to_string()).unwrap();
+    }
     credential_schema_builder.finalize().unwrap()
 }
 
@@ -19,35 +19,28 @@ fn get_non_credential_schema() -> NonCredentialSchema {
     non_credential_schema_builder.finalize().unwrap()
 }
 
-fn get_credential_values() -> CredentialValues {
+fn get_credential_values(attr_size: usize) -> CredentialValues {
     let mut credential_values_builder = Issuer::new_credential_values_builder().unwrap();
-    credential_values_builder
-        .add_dec_known("name", "1139481716457488690172217916278103335")
+    let mut rng = rand::thread_rng();
+    for i in 1..attr_size {
+        let random_value: usize = rng.gen();
+        credential_values_builder
+        .add_dec_known(&i.to_string(), &random_value.to_string())
         .unwrap();
-    credential_values_builder
-        .add_dec_known(
-            "sex",
-            "5944657099558967239210949258394887428692050081607692519917050011144233115103",
-        )
-        .unwrap();
-    credential_values_builder
-        .add_dec_known("age", "28")
-        .unwrap();
-    credential_values_builder
-        .add_dec_known("height", "175")
-        .unwrap();
+    }
     credential_values_builder.finalize().unwrap()
 }
 
 fn get_sub_proof_request() -> SubProofRequest {
     let mut sub_proof_request_builder = Verifier::new_sub_proof_request_builder().unwrap();
-    sub_proof_request_builder.add_revealed_attr("name").unwrap();
+    sub_proof_request_builder.add_revealed_attr("1").unwrap();
     sub_proof_request_builder.finalize().unwrap()
 }
 
 type ProverData = (u32, CredentialValues, CredentialSignature, Witness);
 
 fn setup_cred_and_issue(
+    attr_size: usize,
     max_cred_num: u32,
     issuance_by_default: bool,
 ) -> (
@@ -60,7 +53,7 @@ fn setup_cred_and_issue(
     SimpleTailsAccessor,
     Vec<ProverData>,
 ) {
-    let credential_schema = get_credential_schema();
+    let credential_schema = get_credential_schema(attr_size);
     let non_credential_schema = get_non_credential_schema();
 
     // 2. Issuer creates credential definition(with revocation keys)
@@ -88,6 +81,7 @@ fn setup_cred_and_issue(
     );
 
     let mut prover_data: Vec<ProverData> = vec![];
+    let mut sign_data: Vec<(SignatureCorrectnessProof, CredentialSecretsBlindingFactors, bn::BigNumber)> = vec![];
 
     let mut rev_reg_delta: Option<RevocationRegistryDelta> = if issuance_by_default {
         Some(RevocationRegistryDelta::from(&rev_reg))
@@ -98,7 +92,7 @@ fn setup_cred_and_issue(
     let start = Instant::now();
     let max_issue = max_cred_num.min(100);
     for i in 0..max_issue {
-        let credential_values = get_credential_values();
+        let credential_values = get_credential_values(attr_size);
 
         // 5. Issuer creates nonce used by Prover to create correctness proof for blinded secrets
         let blinding_correctness_nonce = new_nonce().unwrap();
@@ -157,9 +151,19 @@ fn setup_cred_and_issue(
 
         // 9. Prover processes credential signature
         let prover_cred_values = credential_values.merge(&blind_cred_values).unwrap();
+        prover_data.push((rev_idx, prover_cred_values, credential_signature, witness));
+        sign_data.push((signature_correctness_proof, credential_secrets_blinding_factors, signature_correctness_nonce));
+    }
+
+    println!("Issuance time for {max_issue} is {:.2?}", start.elapsed());
+
+    for i in 0..max_issue {
+        let (_rev_idx, ref credential_values, ref mut credential_signature, ref mut witness) =
+            prover_data[i as usize];
+        let (signature_correctness_proof, credential_secrets_blinding_factors, signature_correctness_nonce) = &sign_data[i as usize];
         Prover::process_credential_signature(
-            &mut credential_signature,
-            &prover_cred_values,
+            credential_signature,
+            &credential_values,
             &signature_correctness_proof,
             &credential_secrets_blinding_factors,
             &credential_pub_key,
@@ -169,11 +173,10 @@ fn setup_cred_and_issue(
             Some(&witness),
         )
         .unwrap();
-
-        prover_data.push((rev_idx, prover_cred_values, credential_signature, witness));
     }
-
-    println!("Issuance time for {max_issue} is {:.2?}", start.elapsed());
+    
+    println!("Verify Signature time for {max_issue} is {:.2?}", start.elapsed());
+    
 
     (
         credential_schema,
@@ -265,65 +268,71 @@ fn gen_proofs(
 }
 
 fn main() {
+    let attr_sizes = [2, 4, 8, 15, 20, 30, 40, 60];
     let max_cred_num = 10000;
-    let num_proofs_to_do = 1;
+    let num_proofs_to_do = 100;
     let issuance_by_default = true;
 
     let sub_proof_request = get_sub_proof_request();
-    let (
-        credential_schema,
-        non_credential_schema,
-        credential_pub_key,
-        rev_key_pub,
-        rev_reg,
-        rev_reg_delta,
-        simple_tail_accessor,
-        mut prover_data,
-    ) = setup_cred_and_issue(max_cred_num, issuance_by_default);
 
-    let nonces: Vec<_> = (0..num_proofs_to_do)
-        .map(|_| new_nonce().unwrap())
-        .collect();
+    for attr_size in attr_sizes {
+        println!("Starting for attr size {}...", attr_size);
 
-    let mut start = Instant::now();
-    let proofs = gen_proofs(
-        max_cred_num,
-        issuance_by_default,
-        &credential_schema,
-        &non_credential_schema,
-        &credential_pub_key,
-        &sub_proof_request,
-        &nonces,
-        &rev_reg,
-        &rev_reg_delta,
-        &simple_tail_accessor,
-        &mut prover_data,
-    );
-    println!(
-        "Proof gen time for {} is {:.2?}",
-        num_proofs_to_do,
-        start.elapsed()
-    );
-
-    start = Instant::now();
-    for i in 0..num_proofs_to_do {
-        let idx = i as usize;
-        let mut verifier = Verifier::new_proof_verifier().unwrap();
-        verifier
-            .add_sub_proof_request(
-                &sub_proof_request,
-                &credential_schema,
-                &non_credential_schema,
-                &credential_pub_key,
-                Some(&rev_key_pub),
-                Some(&rev_reg),
-            )
-            .unwrap();
-        assert!(verifier.verify(&proofs[idx], &nonces[idx]).unwrap());
+        let (
+            credential_schema,
+            non_credential_schema,
+            credential_pub_key,
+            rev_key_pub,
+            rev_reg,
+            rev_reg_delta,
+            simple_tail_accessor,
+            mut prover_data,
+        ) = setup_cred_and_issue(attr_size, max_cred_num, issuance_by_default);
+    
+        let nonces: Vec<_> = (0..num_proofs_to_do)
+            .map(|_| new_nonce().unwrap())
+            .collect();
+    
+        let mut start = Instant::now();
+        let proofs = gen_proofs(
+            max_cred_num,
+            issuance_by_default,
+            &credential_schema,
+            &non_credential_schema,
+            &credential_pub_key,
+            &sub_proof_request,
+            &nonces,
+            &rev_reg,
+            &rev_reg_delta,
+            &simple_tail_accessor,
+            &mut prover_data,
+        );
+        println!(
+            "Proof gen time for {} is {:.2?}",
+            num_proofs_to_do,
+            start.elapsed()
+        );
+    
+        start = Instant::now();
+        for i in 0..num_proofs_to_do {
+            let idx = i as usize;
+            let mut verifier = Verifier::new_proof_verifier().unwrap();
+            verifier
+                .add_sub_proof_request(
+                    &sub_proof_request,
+                    &credential_schema,
+                    &non_credential_schema,
+                    &credential_pub_key,
+                    Some(&rev_key_pub),
+                    Some(&rev_reg),
+                )
+                .unwrap();
+            assert!(verifier.verify(&proofs[idx], &nonces[idx]).unwrap());
+        }
+        println!(
+            "Verif time for {} is {:.2?}",
+            num_proofs_to_do,
+            start.elapsed()
+        );
     }
-    println!(
-        "Verif time for {} is {:.2?}",
-        num_proofs_to_do,
-        start.elapsed()
-    );
 }
