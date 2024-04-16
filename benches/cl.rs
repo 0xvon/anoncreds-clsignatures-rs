@@ -268,7 +268,7 @@ fn gen_proofs(
 }
 
 fn main() {
-    let attr_sizes = [2, 4, 8, 15, 20, 30, 40, 60];
+    let attr_sizes = [40];
     let max_cred_num = 10000;
     let num_proofs_to_do = 100;
     let issuance_by_default = true;
